@@ -5,16 +5,22 @@ import (
 	"testing"
 )
 
-type recPrompter struct{ texts []string }
+// recPrompter answers Text with a fixed answer and records every Text
+// invocation (its label) in texts, so tests can assert that an interactive
+// prompt actually fired — and how often, via len(texts).
+type recPrompter struct {
+	text  string
+	texts []string
+}
 
-func (r *recPrompter) Select(string, []string, string) (int, string, error) { return 0, "", nil }
+func (r *recPrompter) Select(string, []string, string) (int, string, error) { return 0, r.text, nil }
 func (r *recPrompter) MultiSelect(string, []string, []string) ([]string, error) {
 	return nil, nil
 }
 func (r *recPrompter) Confirm(string, bool) (bool, error) { return false, nil }
 func (r *recPrompter) Text(label, _, _ string) (string, error) {
 	r.texts = append(r.texts, label)
-	return "val", nil
+	return r.text, nil
 }
 
 type recState struct{ val string }
@@ -33,7 +39,7 @@ func TestGatherPromptsEmptyUnvalidatedField(t *testing.T) {
 	s := &recState{}
 	f := buildAuthTokenField()
 
-	p := &recPrompter{}
+	p := &recPrompter{text: "val"}
 	ctx := WithPrompter(context.Background(), p)
 	_, _, err := Gather(ctx, newNoopSource(), s, []Field[*recState, string]{*f})
 	if err != nil {
