@@ -22,6 +22,25 @@ func (f *fakeSrc) EnvFile(key string) (string, bool) {
 	return v, ok
 }
 
+// recPrompter answers Text with a fixed value and records every Text
+// invocation, so tests can assert that an interactive prompt actually fired.
+type recPrompter struct {
+	text      string
+	textCalls int
+}
+
+func (m *recPrompter) Select(string, []string, string) (int, string, error) {
+	return 0, m.text, nil
+}
+func (m *recPrompter) MultiSelect(string, []string, []string) ([]string, error) {
+	return nil, nil
+}
+func (m *recPrompter) Confirm(string, bool) (bool, error) { return false, nil }
+func (m *recPrompter) Text(string, string, string) (string, error) {
+	m.textCalls++
+	return m.text, nil
+}
+
 // textMockPrompter returns a fixed text from Text() (for the prompt test).
 type textMockPrompter struct{ text string }
 
@@ -258,6 +277,59 @@ func TestField_InvalidFlagIgnoresLowerPrecedence(t *testing.T) {
 	var fe *FieldError
 	require.ErrorAs(t, err, &fe)
 	require.Equal(t, "domain", fe.Name)
+}
+
+// TestField_InvalidFlagRePrompts guards that on an interactive run a
+// present-but-invalid flag never lets a stale valid Operational value settle
+// the field: the prompt must fire and the operator's choice must replace the
+// stale value (Decided + Operational), not silently reuse it.
+func TestField_InvalidFlagRePrompts(t *testing.T) {
+	old := NonInteractive
+	NonInteractive = false
+	defer func() { NonInteractive = old }()
+
+	// The flag supplies an empty string (fails Parse/Validate); without the
+	// re-prompt contract the stale operational value would be marked operative
+	// and the prompt suppressed.
+	mock := &recPrompter{text: "fresh.example.com"}
+	ctx := WithPrompter(context.Background(), mock)
+	s := &testState{operative: "stale.example.com"}
+	var offeredDefault string
+	prompt := &Prompt[string]{
+		Label: "Tunnel domain (required)",
+		CurrentString: func(v string) string {
+			offeredDefault = v
+			return v
+		},
+	}
+	_, fully, err := Gather(ctx, &fakeSrc{flags: map[string]string{"domain": ""}}, s,
+		[]Field[*testState, string]{strField("domain", "domain", "MCP_DOMAIN", false, prompt)})
+	require.NoError(t, err)
+	require.Equal(t, 1, mock.textCalls, "an invalid flag must re-prompt instead of reusing the stale value")
+	require.Equal(t, "stale.example.com", offeredDefault, "the stale value stays as the prompt prefill, not as the settled value")
+	require.NotNil(t, s.decided, "the re-prompted choice is an operator decision")
+	require.Equal(t, "fresh.example.com", *s.decided, "the stale value is replaced by the operator's answer")
+	require.Equal(t, "fresh.example.com", s.operative, "the operator's choice becomes the operative value")
+	require.True(t, fully, "the re-prompted value fully decides the field")
+}
+
+// TestField_InvalidFlagNoPromptDefers guards the no-prompt half of the
+// re-prompt contract: on an interactive run a present-but-invalid flag on a
+// promptless field defers unresolved (no error), and the stale Operational
+// value is NOT silently marked operative.
+func TestField_InvalidFlagNoPromptDefers(t *testing.T) {
+	old := NonInteractive
+	NonInteractive = false
+	defer func() { NonInteractive = old }()
+
+	s := &testState{operative: "stale.example.com"}
+	seeded, fully, err := Gather(context.Background(),
+		&fakeSrc{flags: map[string]string{"domain": ""}},
+		s, []Field[*testState, string]{strField("domain", "domain", "MCP_DOMAIN", false, nil)})
+	require.NoError(t, err, "a promptless field with an invalid flag defers on interactive, no hard error")
+	require.Empty(t, seeded, "a rejected flag value is not a seed source")
+	require.False(t, fully, "the invalid flag must not settle the field from the stale value")
+	require.Nil(t, s.decided, "no operator decision was made this run")
 }
 
 // TestField_PromptInvalidValueErrors guards that the interactive prompt validates

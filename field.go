@@ -178,11 +178,12 @@ func (e *FieldError) Error() string {
 
 // fieldOutcome is a resolved field's result after the non-prompt precedence.
 type fieldOutcome[T any] struct {
-	value      T
-	decided    bool // operator decision this run (switch or prompt commit)
-	operative  bool // has an operative value usable without re-derivation
-	usedSource string
-	hardError  bool // headless, required, unresolved -> fatal
+	value       T
+	decided     bool // operator decision this run (switch or prompt commit)
+	operative   bool // has an operative value usable without re-derivation
+	usedSource  string
+	hardError   bool // headless, required, unresolved -> fatal
+	flagInvalid bool // an explicitly supplied flag failed Parse/Validate this run
 }
 
 // srcKind is the provenance of a candidate value. It selects which channel the
@@ -261,7 +262,12 @@ func (f *Field[S, T]) settle(oc *fieldOutcome[T], s S, v T, src srcKind, headles
 //     ReDerives field, which defers to the step's Execute (it derives the value
 //     via SetOperational afterwards).
 //   - interactive => surface the current operational value as a prompt default;
-//     a valid value settles the field, so Gather skips the prompt.
+//     a valid, non-empty value settles the field, so Gather skips the prompt.
+//   - interactive + an explicitly supplied flag that failed Parse/Validate
+//     (flagInvalid) => never settle from the current operational value, however
+//     valid it looks: the operator named THIS run's value and it was rejected,
+//     so the field re-prompts (or defers unresolved when it has no prompt).
+//     Headless is unchanged: a present-but-invalid flag still hard-errors.
 func classifyOutcome[S any, T any](oc *fieldOutcome[T], f *Field[S, T], s S, headless bool) {
 	if oc.decided || oc.operative {
 		return // already settled; do not clobber
@@ -279,14 +285,21 @@ func classifyOutcome[S any, T any](oc *fieldOutcome[T], f *Field[S, T], s S, hea
 	}
 	cur := f.Operational(s)
 	oc.value = cur
+	// An explicitly supplied but rejected flag suppresses the settle from the
+	// current value (it stays only as the prompt prefill above): without this,
+	// a stale valid Operational value would mark the field operative and the
+	// flag the operator actually passed this run would be silently discarded.
+	if oc.flagInvalid {
+		return
+	}
 	// A field only "settles itself" (marking it operative, so Gather skips the
 	// prompt) when its current value is actually PRESENT. An empty/unset value
-	// (zero for the field's type) must NOT be treated as operative: it falls
-	// through, and Gather's interactive prompt (fired for any field with a
-	// Prompt) collects it. Treating an empty unvalidated value as operative was
-	// a bug — a promptable but empty field was silently marked settled and
-	// never asked, so the written env file lacked the value and downstream
-	// validation failed.
+	// (zero for the field's type — nil pointers, empty slices/maps included)
+	// must NOT be treated as operative: it falls through, and Gather's
+	// interactive prompt (fired for any field with a Prompt) collects it.
+	// Treating an empty unvalidated value as operative was a bug — a promptable
+	// but empty field was silently marked settled and never asked, so the
+	// written env file lacked the value and downstream validation failed.
 	if !isZeroValue(cur) && (f.Validate == nil || f.Validate(cur)) {
 		oc.operative = true
 	}
@@ -295,8 +308,10 @@ func classifyOutcome[S any, T any](oc *fieldOutcome[T], f *Field[S, T], s S, hea
 // isZeroValue reports whether v is the zero value for its type. The explicit
 // type switch covers the common scalar field types cheaply (no allocation); the
 // reflect fallback handles pointer-typed fields (e.g. *bool), where nil is
-// "no value present". A zero value must not count as an operative value that
-// would suppress an interactive prompt.
+// "no value present", and collection fields (slices, maps), where an EMPTY
+// non-nil value is semantically unset — a multi-select field whose current
+// selection is an empty []string must still prompt. A zero value must not
+// count as an operative value that would suppress an interactive prompt.
 func isZeroValue[T any](v T) bool {
 	switch z := any(v).(type) {
 	case string:
@@ -306,9 +321,17 @@ func isZeroValue[T any](v T) bool {
 	case int:
 		return z == 0
 	default:
-		// Pointer-typed fields (e.g. *bool) encode "unset" as nil.
 		rv := reflect.ValueOf(z)
-		return !rv.IsValid() || rv.IsZero()
+		if !rv.IsValid() {
+			return true
+		}
+		// Pointer-typed fields (e.g. *bool) encode "unset" as nil; slices and
+		// maps encode it as empty, because a non-nil empty collection carries
+		// no usable value (IsZero alone reports empty≠nil slices as "set").
+		if (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Map) && rv.Len() == 0 {
+			return true
+		}
+		return rv.IsZero()
 	}
 }
 
@@ -352,13 +375,17 @@ func resolveField[S any, T any](src ValueSource, s S, f *Field[S, T], headless b
 	// -- precedence 1: CLI switch (incl. process-env Sources) ----------------
 	// A present flag decides the field, valid or not: if it settles we are done;
 	// if it is invalid, classifyOutcome produces the terminal outcome (hard-error
-	// headless, prompt/defer interactive). We do not fall through to lower
-	// precedence sources, because the operator explicitly supplied a value.
+	// headless; interactive re-prompts or defers unresolved — flagInvalid keeps
+	// a stale valid Operational value from settling the field, since the
+	// operator explicitly supplied a value THIS run and it was rejected). We do
+	// not fall through to lower precedence sources, because the operator
+	// explicitly supplied a value.
 	if f.Flag != "" {
 		if raw, ok := src.Flag(f.Flag); ok {
 			if v, parsed := f.Parse(raw); parsed && f.settle(&oc, s, v, srcFlag, headless) {
 				return oc, nil
 			}
+			oc.flagInvalid = true
 			classifyOutcome(&oc, f, s, headless)
 			return oc, nil
 		}

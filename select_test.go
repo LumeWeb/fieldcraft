@@ -88,6 +88,30 @@ func TestFieldMultiSelect(t *testing.T) {
 	require.Empty(t, seed, "an interactive prompt is not a seed source")
 }
 
+// TestFieldMultiSelectEmptySelectionStillPrompts guards the collection half of
+// the isZeroValue contract: a NON-NIL EMPTY current selection is an unset
+// value, so the multi-select field must still prompt (and the operator's
+// choice be committed) instead of silently settling on the empty slice and
+// suppressing the prompt.
+func TestFieldMultiSelectEmptySelectionStillPrompts(t *testing.T) {
+	old := NonInteractive
+	NonInteractive = false
+	defer func() { NonInteractive = old }()
+
+	mp := &multiPrompter{multiResult: []string{"agent-a"}}
+	ctx := WithPrompter(context.Background(), mp)
+
+	st := &multiState{agents: []string{}} // present but empty -> semantically unset
+	_, fully, err := GatherAny(ctx, &fakeSrc{}, st,
+		[]AnyField[*multiState]{erase(specAgents().Field())})
+	require.NoError(t, err)
+	require.Len(t, mp.multiLabels, 1, "a non-nil empty selection must not suppress the prompt")
+	require.Equal(t, []string{"agent-a", "agent-b", "agent-c"}, mp.multiOptions[0])
+	require.True(t, fully, "the committed multi-select value is fully decided")
+	require.Equal(t, []string{"agent-a"}, st.agents, "the prompted choice is committed")
+	require.Empty(t, mp.multiPreChecked[0], "an empty current value pre-checks nothing")
+}
+
 // optionsState has one field whose choice list is API/FS-derived.
 type optionsState struct {
 	choice string
