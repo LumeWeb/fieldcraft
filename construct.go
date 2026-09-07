@@ -168,7 +168,10 @@ func applyPromptMeta[S any, T any](spec *fieldSpec[S, T], m Meta) {
 		if m.Mask != "" {
 			spec.Prompt.Mask = m.Mask
 		}
-		if m.Options != nil {
+		// Meta.Options is the declaration path for Str/Bool/Int selects; for
+		// Enum the typed options already drive Parse and the schema, so a
+		// loose string list in Meta must not diverge from them.
+		if m.Options != nil && spec.Prompt.Options == nil {
 			spec.Prompt.Options = m.Options
 		}
 	}

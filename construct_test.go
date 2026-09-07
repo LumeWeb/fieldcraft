@@ -297,3 +297,57 @@ func TestMetaDefaultWiresDerived(t *testing.T) {
 			Meta{Default: "not-an-int"})
 	}, "a mismatched Meta.Default must panic, not silently no-op")
 }
+
+// TestEnumPromptOptionsNotOverwritten guards that Meta.Options cannot clobber
+// an Enum's typed options: the options the prompt and JSON schema offer are
+// exactly the typed options Parse validates on the flag path, so a stale or
+// wrong loose list in Meta must not make the prompt accept values Gather
+// rejects.
+func TestEnumPromptOptionsNotOverwritten(t *testing.T) {
+	type provider string
+	const (
+		openai     provider = "openai"
+		cloudflare provider = "cloudflare"
+	)
+	e := Enum[*cfgState, provider](strEnumDecided[provider](), "Provider",
+		func(s *cfgState) *provider { return nil },
+		func(s *cfgState, v provider) {},
+		[]provider{openai, cloudflare},
+		Meta{Flag: "provider", Options: []string{"openai", "not-a-provider"}})
+
+	field := e.Declared().(*Field[*cfgState, provider])
+	require.Equal(t, []string{"openai", "cloudflare"}, field.Prompt.Options,
+		"the typed options, not Meta.Options, must drive the prompt")
+
+	sch := field.Schema()
+	require.NotNil(t, sch.Enum)
+	require.Equal(t, []any{"openai", "cloudflare"}, sch.Enum,
+		"schema choices must match the options Parse validates")
+
+	// The prompt-visible choice still gathers through the flag path.
+	s := &cfgState{}
+	_, _, err := GatherAny(context.Background(),
+		&fakeSrc{flags: map[string]string{"provider": "cloudflare"}},
+		s, []AnyField[*cfgState]{e})
+	require.NoError(t, err)
+	require.NotNil(t, field.Decided(s), "a valid flag choice must be an operator decision")
+	require.Equal(t, cloudflare, *field.Decided(s))
+}
+
+// TestMetaOptionsDrivesStrPrompt guards the non-Enum select path: for Str
+// (whose prompt has no static options of its own) Meta.Options is the
+// declaration path and must still land in Prompt.Options.
+func TestMetaOptionsDrivesStrPrompt(t *testing.T) {
+	dec := Decided[*cfgState, string]{
+		Read:  func(*cfgState, string) *string { return nil },
+		Write: func(*cfgState, string, string) {},
+	}
+	f := Str(dec, "Domain",
+		func(s *cfgState) string { return s.Domain },
+		func(s *cfgState, v string) { s.Domain = v },
+		Meta{Options: []string{"a", "b"}})
+
+	field := f.Declared().(*Field[*cfgState, string])
+	require.Equal(t, []string{"a", "b"}, field.Prompt.Options,
+		"Meta.Options still declares choices for a Str select")
+}
